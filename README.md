@@ -13,9 +13,9 @@ Add AuraFlow architecture to Forge
 
 ## Result
 
-![forge][forge.png]
+![forge](forge.png)
 
-![cthulhu][cthulhu.png]
+![cthulhu](cthulhu.png)
 
 ## Todo
 
