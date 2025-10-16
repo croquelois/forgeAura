@@ -1,0 +1,163 @@
+diff --git a/backend/loader.py b/backend/loader.py
+index a090ada..ee221a7 100644
+--- a/backend/loader.py
++++ b/backend/loader.py
+@@ -23,14 +23,27 @@ from backend.diffusion_engine.sdxl import StableDiffusionXL, StableDiffusionXLRe
+ from backend.diffusion_engine.sd35 import StableDiffusion3
+ from backend.diffusion_engine.flux import Flux
+ from backend.diffusion_engine.chroma import Chroma
++from backend.diffusion_engine.auraflow import AuraFlow
+ 
+-
+-possible_models = [StableDiffusion, StableDiffusion2, StableDiffusionXLRefiner, StableDiffusionXL, StableDiffusion3, Chroma, Flux]
++possible_models = [StableDiffusion, StableDiffusion2, StableDiffusionXLRefiner, StableDiffusionXL, StableDiffusion3, Chroma, Flux, AuraFlow]
+ 
+ 
+ logging.getLogger("diffusers").setLevel(logging.ERROR)
+ dir_path = os.path.dirname(__file__)
+ 
++## Patching huggingface_guess for AuraFlow
++def auraflow_clip_target(self, state_dict={}):
++        result = {}
++        pref = self.text_encoder_key_prefix[0]
++
++        if "{}pile_t5xl.transformer.encoder.final_layer_norm.weight".format(pref) in state_dict:
++            result['pile_t5xl'] = 'text_encoder'
++        return result
++
++huggingface_guess.model_list.AuraFlow.clip_target = auraflow_clip_target
++huggingface_guess.model_list.AuraFlow.huggingface_repo = 'AuraFlow'
++huggingface_guess.model_list.AuraFlow.unet_target = 'transformer'
++huggingface_guess.model_list.AuraFlow.unet_extra_config = {"in_channels": 4}
+ 
+ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_path, state_dict):
+     config_path = os.path.join(repo_path, component_name)
+@@ -78,7 +91,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
+             ], log_name=cls_name)
+ 
+             return model
+-        if cls_name == 'T5EncoderModel':
++        if cls_name == 'T5EncoderModel' or cls_name == 'UMT5EncoderModel':
+             assert isinstance(state_dict, dict) and len(state_dict) > 16, 'You do not have T5 state dict!'
+ 
+             from backend.nn.t5 import IntegratedT5
+@@ -109,7 +122,7 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
+             load_state_dict(model, state_dict, log_name=cls_name, ignore_errors=['transformer.encoder.embed_tokens.weight', 'logit_scale'])
+ 
+             return model
+-        if cls_name in ['UNet2DConditionModel', 'FluxTransformer2DModel', 'SD3Transformer2DModel', 'ChromaTransformer2DModel']:
++        if cls_name in ['UNet2DConditionModel', 'FluxTransformer2DModel', 'SD3Transformer2DModel', 'ChromaTransformer2DModel', 'AuraFlowTransformer2DModel']:
+             assert isinstance(state_dict, dict) and len(state_dict) > 16, 'You do not have model state dict!'
+ 
+             model_loader = None
+@@ -121,6 +134,9 @@ def load_huggingface_component(guess, component_name, lib_name, cls_name, repo_p
+             elif cls_name == 'ChromaTransformer2DModel':
+                 from backend.nn.chroma import IntegratedChromaTransformer2DModel
+                 model_loader = lambda c: IntegratedChromaTransformer2DModel(**c)
++            elif cls_name == 'AuraFlowTransformer2DModel':
++                from backend.nn.auraflow import MMDiT
++                model_loader = lambda c: MMDiT(**c)
+             elif cls_name == 'SD3Transformer2DModel':
+                 from backend.nn.mmditx import MMDiTX
+                 model_loader = lambda c: MMDiTX(**c)
+@@ -440,6 +456,8 @@ def replace_state_dict(sd, asd, guess):
+ 
+ 
+ def preprocess_state_dict(sd):
++    if any(k.startswith("model.double_layers") for k in sd.keys()): # AuraFlow
++        return sd
+     if not any(k.startswith("model.diffusion_model") for k in sd.keys()):
+         sd = {f"model.diffusion_model.{k}": v for k, v in sd.items()}
+ 
+@@ -511,7 +529,8 @@ def forge_loader(sd, additional_state_dicts=None):
+         for x in GuessChroma.unet_remove_config:
+             del estimated_config.unet_config[x]
+         state_dicts['text_encoder'] = state_dicts['text_encoder_2']
+-        del state_dicts['text_encoder_2'] 
++        del state_dicts['text_encoder_2']
++        
+     repo_name = estimated_config.huggingface_repo
+ 
+     local_path = os.path.join(dir_path, 'huggingface', repo_name)
+diff --git a/backend/nn/t5.py b/backend/nn/t5.py
+index 74e0ab7..91538cb 100644
+--- a/backend/nn/t5.py
++++ b/backend/nn/t5.py
+@@ -201,10 +201,13 @@ class T5(torch.nn.Module):
+         self.encoder = T5Stack(self.num_layers, model_dim, model_dim, config["d_ff"], config["dense_act_fn"], config["is_gated_act"], config["num_heads"], config["model_type"] != "umt5")
+         self.shared = torch.nn.Embedding(config["vocab_size"], model_dim)
+ 
+-    def forward(self, input_ids, *args, **kwargs):
+-        x = self.shared(input_ids)
++    def forward(self, input_ids, attention_mask=None, embeds=None, *args, **kwargs):
++        if input_ids is None:
++            x = embeds
++        else:
++            x = self.shared(input_ids)
+         x = torch.nan_to_num(x)
+-        return self.encoder(x, *args, **kwargs)
++        return self.encoder(x, attention_mask=attention_mask, *args, **kwargs)
+ 
+ 
+ class IntegratedT5(torch.nn.Module):
+diff --git a/backend/text_processing/t5_engine.py b/backend/text_processing/t5_engine.py
+index e00cccc..5f5f634 100644
+--- a/backend/text_processing/t5_engine.py
++++ b/backend/text_processing/t5_engine.py
+@@ -17,7 +17,7 @@ class PromptChunk:
+ 
+ 
+ class T5TextProcessingEngine:
+-    def __init__(self, text_encoder, tokenizer, emphasis_name="Original", min_length=256):
++    def __init__(self, text_encoder, tokenizer, emphasis_name="Original", min_length=256, use_attention_mask=False):
+         super().__init__()
+ 
+         self.text_encoder = text_encoder.transformer
+@@ -25,6 +25,7 @@ class T5TextProcessingEngine:
+ 
+         self.emphasis = emphasis.get_current_option(opts.emphasis)()
+         self.min_length = min_length
++        self.use_attention_mask = use_attention_mask
+         self.id_end = 1
+         self.id_pad = 0
+ 
+@@ -54,15 +55,34 @@ class T5TextProcessingEngine:
+         tokenized = self.tokenizer(texts, truncation=False, add_special_tokens=False)["input_ids"]
+         return tokenized
+ 
++    def compute_attention_mask(self, tokens):
++        if not self.use_attention_mask:
++            return None
++        attention_masks = []
++        for x in tokens:
++            attention_mask = []
++            eos = False
++            for y in x:
++                if eos:
++                    attention_mask.append(0)
++                else:
++                    attention_mask.append(1)
++                token = int(y)
++                if not eos and token == self.id_end:
++                    eos = True
++            attention_masks.append(attention_mask)
++        return torch.tensor(attention_masks)
++
+     def encode_with_transformers(self, tokens):
+         device = memory_management.text_encoder_device()
+         tokens = tokens.to(device)
+         self.text_encoder.shared.to(device=device, dtype=torch.float32)
+-
+-        z = self.text_encoder(
+-            input_ids=tokens,
+-        )
+-
++        attention_mask = self.compute_attention_mask(tokens)
++        if attention_mask is not None:
++            attention_mask = attention_mask.to(device=device)
++        z = self.text_encoder(input_ids=tokens, attention_mask=attention_mask)
++        if attention_mask is not None:
++           z *= attention_mask.unsqueeze(-1).float()
+         return z
+ 
+     def tokenize_line(self, line):
